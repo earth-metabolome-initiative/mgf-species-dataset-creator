@@ -1,0 +1,2 @@
+• The source MGF has MERGED_STATS lines but no MERGED_SCANS, and this GitHub mascot-rs version requires both when merged-scan metadata is present. Since those fields are not part of the taxonomy enrichment and mascot-rs does not write them back in its
+  canonical output anyway, I’m going to preprocess only the in-memory parse input to skip MERGED_STATS lines for this dataset, then still parse and write via mascot-rs.
