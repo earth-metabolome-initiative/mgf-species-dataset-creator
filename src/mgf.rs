@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use mascot_rs::prelude::MGFVec;
+use mascot_rs::prelude::{MGFVec, SpectrumAlloc};
 use serde::Serialize;
 
 use crate::error::IoResultExt;
@@ -24,6 +24,8 @@ pub struct EnrichmentStats {
     pub spectra_without_taxo: usize,
     /// Number of enriched spectra without NCBI resolution.
     pub spectra_without_ncbi_resolution: usize,
+    /// Number of most intense peaks kept per spectrum; zero means all peaks were kept.
+    pub top_k_peaks: usize,
 }
 
 /// Enriches one MGF file with EMI taxonomy headers and writes a new MGF file.
@@ -31,6 +33,7 @@ pub fn enrich_mgf_file(
     input_path: &Path,
     output_dir: &Path,
     taxo: &TaxoDataset,
+    top_k_peaks: usize,
     overwrite: bool,
 ) -> Result<EnrichmentStats> {
     std::fs::create_dir_all(output_dir).map_err(|source| Error::Io {
@@ -51,6 +54,7 @@ pub fn enrich_mgf_file(
         spectra_enriched: 0,
         spectra_without_taxo: 0,
         spectra_without_ncbi_resolution: 0,
+        top_k_peaks,
     };
 
     for spectrum in spectra.iter_mut() {
@@ -76,6 +80,7 @@ pub fn enrich_mgf_file(
         }
     }
 
+    let spectra = apply_top_k_peaks(spectra, top_k_peaks, input_path)?;
     spectra
         .to_path(&output_path)
         .map_err(|source| Error::Mascot {
@@ -83,6 +88,22 @@ pub fn enrich_mgf_file(
             source,
         })?;
     Ok(stats)
+}
+
+/// Keeps only the top K most intense peaks per spectrum through mascot-rs.
+fn apply_top_k_peaks(spectra: MGFVec, top_k_peaks: usize, input_path: &Path) -> Result<MGFVec> {
+    if top_k_peaks == 0 {
+        return Ok(spectra);
+    }
+    spectra
+        .into_iter()
+        .map(|spectrum| spectrum.top_k_peaks(top_k_peaks))
+        .collect::<mascot_rs::prelude::Result<Vec<_>>>()
+        .map(MGFVec::from)
+        .map_err(|source| Error::Mascot {
+            path: input_path.to_path_buf(),
+            source,
+        })
 }
 
 /// Loads an MGF file with dataset-specific tolerance for incomplete merged-scan headers.
@@ -178,6 +199,8 @@ fn output_path_for(input_path: &Path, output_dir: &Path) -> PathBuf {
 /// Tests for MGF output naming and mascot-rs metadata insertion.
 mod tests {
     use super::*;
+    use mascot_rs::prelude::Spectrum;
+
     use crate::taxo::TaxoRecord;
     use crate::taxonomy::ResolvedTaxon;
 
@@ -236,6 +259,30 @@ mod tests {
                 .arbitrary_metadata_value("EMI_TAXON_LINEAGE_NAMES"),
             Some("root|Homo sapiens")
         );
+    }
+
+    #[test]
+    /// Verifies top-K filtering is delegated to mascot-rs and preserves MGF metadata.
+    fn keeps_top_k_peaks_with_mascot_api() {
+        let document = concat!(
+            "BEGIN IONS\n",
+            "FEATURE_ID=feature-1\n",
+            "PEPMASS=250.0\n",
+            "CHARGE=1\n",
+            "MSLEVEL=2\n",
+            "100.0 10.0\n",
+            "150.0 50.0\n",
+            "200.0 20.0\n",
+            "END IONS\n",
+        );
+        let spectra: MGFVec = document.parse().expect("valid fixture");
+
+        let filtered =
+            apply_top_k_peaks(spectra, 2, Path::new("fixture.mgf")).expect("top-k filtering");
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].len(), 2);
+        assert_eq!(filtered[0].feature_id(), Some("feature-1"));
     }
 
     #[test]

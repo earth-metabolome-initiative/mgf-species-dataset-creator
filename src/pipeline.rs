@@ -30,6 +30,8 @@ pub struct ProcessedMgf {
     pub spectra_without_taxo: usize,
     /// Number of enriched spectra without NCBI resolution.
     pub spectra_without_ncbi_resolution: usize,
+    /// Number of most intense peaks kept per spectrum; zero means all peaks were kept.
+    pub top_k_peaks: usize,
 }
 
 /// Report for a completed pipeline run.
@@ -123,7 +125,17 @@ pub async fn run_pipeline_with_progress(
     ));
 
     std::fs::create_dir_all(&config.output_dir).with_path(&config.output_dir)?;
-    let bar = progress.bar(total_mgfs as u64, "Enriching MGF files");
+    let bar = progress.bar(
+        total_mgfs as u64,
+        if config.top_k_peaks == 0 {
+            "Enriching MGF files without peak filtering".to_string()
+        } else {
+            format!(
+                "Enriching MGF files and keeping top {} peaks",
+                config.top_k_peaks
+            )
+        },
+    );
     let mut processed_mgfs = Vec::with_capacity(total_mgfs);
     for (sample_root, taxo, mgf_paths) in sample_jobs {
         let sample_output_dir = config.output_dir.join(
@@ -138,7 +150,13 @@ pub async fn run_pipeline_with_progress(
                 ProgressReporter::file_label(&input_path)
             ));
             info!(path = %input_path.display(), "enriching MGF");
-            let stats = enrich_mgf_file(&input_path, &sample_output_dir, &taxo, config.overwrite)?;
+            let stats = enrich_mgf_file(
+                &input_path,
+                &sample_output_dir,
+                &taxo,
+                config.top_k_peaks,
+                config.overwrite,
+            )?;
             processed_mgfs.push(processed_from_stats(stats));
             bar.inc(1);
         }
@@ -202,6 +220,7 @@ fn processed_from_stats(stats: EnrichmentStats) -> ProcessedMgf {
         spectra_enriched: stats.spectra_enriched,
         spectra_without_taxo: stats.spectra_without_taxo,
         spectra_without_ncbi_resolution: stats.spectra_without_ncbi_resolution,
+        top_k_peaks: stats.top_k_peaks,
     }
 }
 

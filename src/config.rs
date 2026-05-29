@@ -87,6 +87,8 @@ pub struct PipelineConfig {
     pub output_dir: PathBuf,
     /// MGF polarity selection.
     pub polarity: Polarity,
+    /// Number of most intense fragment peaks to keep per spectrum; zero disables filtering.
+    pub top_k_peaks: usize,
     /// Whether existing output files may be replaced.
     pub overwrite: bool,
 }
@@ -103,6 +105,7 @@ impl Default for PipelineConfig {
             taxdump_dir: PathBuf::from("taxdump"),
             output_dir: PathBuf::from("output"),
             polarity: Polarity::Both,
+            top_k_peaks: 128,
             overwrite: false,
         }
     }

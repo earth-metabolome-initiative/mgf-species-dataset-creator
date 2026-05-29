@@ -44,6 +44,8 @@ This writes:
 
 The CLI prints each major stage, shows a byte progress bar while downloading
 the Zenodo archive, and shows a file progress bar while enriching MGF files.
+Output spectra keep the top 128 most intense peaks by default, using
+`mascot-rs` peak editing APIs.
 
 By default, downloads are cached under `.cache/zenodo` and extracted under
 `.cache/extracted`.
@@ -78,6 +80,8 @@ Common options:
 - `--taxdump-dir <path>`: local NCBI taxdump directory.
 - `--output-dir output`: output directory.
 - `--polarity both`: one of `pos`, `neg`, or `both`.
+- `--top-k-peaks 128`: keep the top K most intense peaks per spectrum; use `0`
+  to keep all peaks.
 - `--overwrite`: replace existing enriched MGF files.
 
 ## Added MGF Headers

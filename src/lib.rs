@@ -14,6 +14,8 @@ pub mod mgf;
 pub mod pipeline;
 /// Terminal progress reporting helpers.
 pub mod progress;
+/// Utilities for repairing and publishing corrected PF1600 archives.
+pub mod repair;
 /// Dataset-specific taxonomic metadata parsing.
 pub mod taxo;
 /// NCBI taxonomy dump parsing and resolution.

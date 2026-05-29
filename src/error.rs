@@ -35,6 +35,9 @@ pub enum Error {
     /// Zenodo API or download operation failed.
     #[error("Zenodo error: {0}")]
     Zenodo(#[from] zenodo_rs::ZenodoError),
+    /// HTTP operation failed.
+    #[error("HTTP error: {0}")]
+    Http(#[from] reqwest::Error),
     /// MGF parsing, editing, or writing failed through mascot-rs.
     #[error("Mascot MGF error at {path}: {source}")]
     Mascot {
@@ -67,6 +70,9 @@ pub enum Error {
     /// An output path already exists and overwrite was disabled.
     #[error("output already exists: {0}; pass --overwrite to replace it")]
     OutputExists(PathBuf),
+    /// A required configuration value was not provided.
+    #[error("missing required value: {0}")]
+    MissingValue(String),
 }
 
 /// Crate-local result alias.
