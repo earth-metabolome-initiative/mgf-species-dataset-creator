@@ -4,13 +4,14 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use flate2::Compression;
+use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use serde::Serialize;
-use tar::Builder;
+use tar::{Archive, Builder};
 use tracing::info;
 use zenodo_rs::{
-    AccessRight, Auth, Creator, DepositMetadataUpdate, Endpoint, UploadSpec, UploadType,
-    ZenodoClient,
+    AccessRight, Auth, Creator, DepositMetadataUpdate, DepositionId, Endpoint, FileReplacePolicy,
+    UploadSpec, UploadType, ZenodoClient,
 };
 
 use crate::Error;
@@ -45,6 +46,10 @@ pub struct PublishConfig {
     pub token: String,
     /// Whether to use Zenodo sandbox rather than production Zenodo.
     pub sandbox: bool,
+    /// Whether to create a separate new dataset instead of versioning an existing record.
+    pub new_dataset: bool,
+    /// Published Zenodo deposition/record ID to version.
+    pub record_id: u64,
     /// Zenodo dataset title.
     pub title: String,
     /// Zenodo creator display name.
@@ -88,7 +93,7 @@ pub async fn repair_dataset(
         progress,
     )?;
     let (zenodo_record_id, zenodo_doi) = if let Some(publish) = publish {
-        publish_archive(&config.archive_path, publish, progress).await?
+        publish_archive_version(&config.archive_path, publish, progress).await?
     } else {
         (None, None)
     };
@@ -184,7 +189,68 @@ fn count_files(root: &Path) -> Result<u64> {
     Ok(count)
 }
 
-/// Downloads the two corrected MassIVE MGF files into the working copy.
+/// Restores the two original Sirius artifact files from the Zenodo archive.
+pub fn restore_legacy_sirius_files(
+    original_archive_path: &Path,
+    work_dataset_dir: &Path,
+    progress: &ProgressReporter,
+) -> Result<Vec<PathBuf>> {
+    let targets = [
+        (
+            Path::new("VGF138_A01/pos/VGF138_A01_features_ms2_pos.mgf"),
+            Path::new("VGF138_A01/pos/VGF138_A01_sirius_pos.mgf"),
+        ),
+        (
+            Path::new("VGF151_E05/pos/VGF151_E05_features_ms2_pos.mgf"),
+            Path::new("VGF151_E05/pos/VGF151_E05_sirius_pos.mgf"),
+        ),
+    ];
+    let spinner = progress.spinner(format!(
+        "Restoring legacy Sirius artifacts from {} (sequential archive scan)",
+        original_archive_path.display()
+    ));
+    let file = File::open(original_archive_path).with_path(original_archive_path)?;
+    let decoder = GzDecoder::new(file);
+    let mut archive = Archive::new(decoder);
+    let mut restored = Vec::new();
+
+    for entry in archive.entries().with_path(original_archive_path)? {
+        let mut entry = entry.with_path(original_archive_path)?;
+        let entry_path = entry.path().with_path(original_archive_path)?.into_owned();
+        let Some((_, legacy_relative_path)) = targets
+            .iter()
+            .find(|(source_relative_path, _)| entry_path.ends_with(source_relative_path))
+        else {
+            continue;
+        };
+        let destination = work_dataset_dir.join(legacy_relative_path);
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent).with_path(parent)?;
+        }
+        entry.unpack(&destination).with_path(&destination)?;
+        restored.push(destination);
+        if restored.len() == targets.len() {
+            break;
+        }
+    }
+
+    if restored.len() != targets.len() {
+        return Err(Error::MissingValue(format!(
+            "restored {} of {} legacy Sirius artifact files from {}",
+            restored.len(),
+            targets.len(),
+            original_archive_path.display()
+        )));
+    }
+
+    spinner.finish_with_message(format!(
+        "Restored {} legacy Sirius artifact file(s)",
+        restored.len()
+    ));
+    Ok(restored)
+}
+
+/// Preserves originals as Sirius artifacts and downloads corrected MassIVE files.
 async fn download_replacements(
     work_dataset_dir: &Path,
     progress: &ProgressReporter,
@@ -210,10 +276,7 @@ async fn download_replacements(
             return Err(Error::MissingPath(destination));
         }
         let legacy_destination = work_dataset_dir.join(&legacy_relative_path);
-        if legacy_destination.exists() {
-            std::fs::remove_file(&legacy_destination).with_path(&legacy_destination)?;
-        }
-        std::fs::rename(&destination, &legacy_destination).with_path(&legacy_destination)?;
+        std::fs::copy(&destination, &legacy_destination).with_path(&legacy_destination)?;
         preserved.push(legacy_destination);
 
         let spinner =
@@ -312,13 +375,23 @@ fn append_tree_with_progress<W: std::io::Write>(
     Ok(())
 }
 
-/// Publishes the corrected archive as a new Zenodo dataset.
-async fn publish_archive(
+/// Publishes an existing corrected archive as a new version of an existing Zenodo dataset.
+pub async fn publish_archive_version(
     archive_path: &Path,
     config: PublishConfig,
     progress: &ProgressReporter,
 ) -> Result<(Option<u64>, Option<String>)> {
-    let spinner = progress.spinner("Publishing corrected archive to Zenodo");
+    if !archive_path.exists() {
+        return Err(Error::MissingPath(archive_path.to_path_buf()));
+    }
+    let spinner = if config.new_dataset {
+        progress.spinner("Publishing corrected archive as a new Zenodo dataset")
+    } else {
+        progress.spinner(format!(
+            "Publishing corrected archive as a new version of Zenodo record {}",
+            config.record_id
+        ))
+    };
     let mut builder = ZenodoClient::builder(Auth::new(config.token));
     if config.sandbox {
         builder = builder.endpoint(Endpoint::Sandbox);
@@ -337,17 +410,36 @@ async fn publish_archive(
         .and_then(|name| name.to_str())
         .ok_or_else(|| Error::MissingValue("archive filename".to_string()))?
         .to_string();
-    let published = client
-        .create_and_publish_dataset(
-            &metadata,
-            vec![UploadSpec::from_path_as(archive_path, uploaded_name).with_path(archive_path)?],
-        )
-        .await?;
+    let upload = UploadSpec::from_path_as(archive_path, uploaded_name).with_path(archive_path)?;
+    let published = if config.new_dataset {
+        client
+            .create_and_publish_dataset(&metadata, vec![upload])
+            .await?
+    } else {
+        client
+            .publish_dataset_with_policy(
+                DepositionId(config.record_id),
+                &metadata,
+                FileReplacePolicy::ReplaceAll,
+                vec![upload],
+            )
+            .await?
+    };
     let record_id = published.record.id.0;
     let doi = published.record.doi.map(|doi| doi.to_string());
-    spinner.finish_with_message(format!(
-        "Published corrected dataset as Zenodo record {record_id}"
-    ));
-    info!(record_id, ?doi, "published corrected Zenodo dataset");
+    if config.new_dataset {
+        spinner.finish_with_message(format!(
+            "Published corrected dataset as Zenodo record {record_id}"
+        ));
+    } else {
+        spinner.finish_with_message(format!(
+            "Published corrected dataset version as Zenodo record {record_id}"
+        ));
+    }
+    info!(
+        record_id,
+        ?doi,
+        "published corrected Zenodo dataset version"
+    );
     Ok((Some(record_id), doi))
 }

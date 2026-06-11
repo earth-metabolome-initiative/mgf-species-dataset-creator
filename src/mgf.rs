@@ -26,38 +26,48 @@ pub struct EnrichmentStats {
     pub spectra_without_ncbi_resolution: usize,
     /// Number of most intense peaks kept per spectrum; zero means all peaks were kept.
     pub top_k_peaks: usize,
+    /// Whether peak intensities were normalized.
+    pub normalize_peak_intensities: bool,
 }
 
-/// Enriches one MGF file with EMI taxonomy headers and writes a new MGF file.
-pub fn enrich_mgf_file(
-    input_path: &Path,
-    output_dir: &Path,
-    taxo: &TaxoDataset,
-    top_k_peaks: usize,
-    overwrite: bool,
-) -> Result<EnrichmentStats> {
-    std::fs::create_dir_all(output_dir).map_err(|source| Error::Io {
-        path: output_dir.to_path_buf(),
-        source,
-    })?;
-    let output_path = output_path_for(input_path, output_dir);
-    if output_path.exists() && !overwrite {
-        return Err(Error::OutputExists(output_path));
-    }
+/// Enriched spectra and summary statistics for one source MGF file.
+#[derive(Debug)]
+pub struct EnrichedMgf {
+    /// Enriched spectra parsed from the source MGF file.
+    pub spectra: MGFVec,
+    /// Summary statistics for the source file.
+    pub stats: EnrichmentStats,
+}
 
+/// Enriches one MGF file with EMI taxonomy headers and returns parsed spectra.
+pub fn enrich_mgf_records(
+    input_path: &Path,
+    output_path: &Path,
+    taxo: &TaxoDataset,
+    sample_metadata: &[(String, String)],
+    top_k_peaks: usize,
+    normalize_peak_intensities: bool,
+) -> Result<EnrichedMgf> {
     let mut spectra = load_mgf_vec(input_path)?;
 
     let mut stats = EnrichmentStats {
         input_path: input_path.to_path_buf(),
-        output_path: output_path.clone(),
+        output_path: output_path.to_path_buf(),
         spectra_total: spectra.len(),
         spectra_enriched: 0,
         spectra_without_taxo: 0,
         spectra_without_ncbi_resolution: 0,
         top_k_peaks,
+        normalize_peak_intensities,
     };
 
     for spectrum in spectra.iter_mut() {
+        insert_sample_metadata(spectrum.metadata_mut(), sample_metadata).map_err(|source| {
+            Error::Mascot {
+                path: input_path.to_path_buf(),
+                source,
+            }
+        })?;
         let feature_id = spectrum
             .feature_id()
             .or_else(|| spectrum.scans())
@@ -70,34 +80,62 @@ pub fn enrich_mgf_file(
             stats.spectra_without_taxo += 1;
             continue;
         };
+        if record.ncbi.is_none() {
+            stats.spectra_without_ncbi_resolution += 1;
+            continue;
+        }
         insert_emi_metadata(spectrum.metadata_mut(), record).map_err(|source| Error::Mascot {
             path: input_path.to_path_buf(),
             source,
         })?;
         stats.spectra_enriched += 1;
-        if record.ncbi.is_none() {
-            stats.spectra_without_ncbi_resolution += 1;
-        }
     }
 
-    let spectra = apply_top_k_peaks(spectra, top_k_peaks, input_path)?;
-    spectra
-        .to_path(&output_path)
-        .map_err(|source| Error::Mascot {
-            path: output_path.clone(),
-            source,
-        })?;
-    Ok(stats)
+    let spectra =
+        apply_peak_processing(spectra, top_k_peaks, normalize_peak_intensities, input_path)?;
+    Ok(EnrichedMgf { spectra, stats })
 }
 
-/// Keeps only the top K most intense peaks per spectrum through mascot-rs.
-fn apply_top_k_peaks(spectra: MGFVec, top_k_peaks: usize, input_path: &Path) -> Result<MGFVec> {
-    if top_k_peaks == 0 {
+/// Writes an enriched MGF collection to a path through mascot-rs.
+pub fn write_mgf_file(spectra: &MGFVec, output_path: &Path, overwrite: bool) -> Result<()> {
+    if output_path.exists() && !overwrite {
+        return Err(Error::OutputExists(output_path.to_path_buf()));
+    }
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent).with_path(parent)?;
+    }
+    spectra
+        .to_path(output_path)
+        .map_err(|source| Error::Mascot {
+            path: output_path.to_path_buf(),
+            source,
+        })
+}
+
+/// Applies top-K peak filtering and intensity normalization through mascot-rs.
+fn apply_peak_processing(
+    spectra: MGFVec,
+    top_k_peaks: usize,
+    normalize_peak_intensities: bool,
+    input_path: &Path,
+) -> Result<MGFVec> {
+    if top_k_peaks == 0 && !normalize_peak_intensities {
         return Ok(spectra);
     }
     spectra
         .into_iter()
-        .map(|spectrum| spectrum.top_k_peaks(top_k_peaks))
+        .map(|spectrum| {
+            let spectrum = if top_k_peaks == 0 {
+                spectrum
+            } else {
+                spectrum.top_k_peaks(top_k_peaks)?
+            };
+            if normalize_peak_intensities {
+                spectrum.intensity_normalized()
+            } else {
+                Ok(spectrum)
+            }
+        })
         .collect::<mascot_rs::prelude::Result<Vec<_>>>()
         .map(MGFVec::from)
         .map_err(|source| Error::Mascot {
@@ -107,7 +145,7 @@ fn apply_top_k_peaks(spectra: MGFVec, top_k_peaks: usize, input_path: &Path) -> 
 }
 
 /// Loads an MGF file with dataset-specific tolerance for incomplete merged-scan headers.
-fn load_mgf_vec(input_path: &Path) -> Result<MGFVec> {
+pub(crate) fn load_mgf_vec(input_path: &Path) -> Result<MGFVec> {
     let content = std::fs::read_to_string(input_path).with_path(input_path)?;
     let filtered = filter_parseable_ms2_blocks(&content);
     MGFVec::try_from_iter(filtered.iter().map(String::as_str)).map_err(|source| Error::Mascot {
@@ -156,43 +194,26 @@ fn block_is_ms2(block: &[String]) -> bool {
         .any(|line| line.trim().eq_ignore_ascii_case("MSLEVEL=2"))
 }
 
+/// Inserts sample-level metadata through mascot-rs arbitrary metadata APIs.
+fn insert_sample_metadata(
+    metadata: &mut mascot_rs::prelude::MascotGenericFormatMetadata,
+    sample_metadata: &[(String, String)],
+) -> mascot_rs::prelude::Result<()> {
+    for (key, value) in sample_metadata {
+        metadata.insert_arbitrary_metadata(key, value)?;
+    }
+    Ok(())
+}
+
 /// Inserts EMI taxonomy metadata through mascot-rs metadata editing APIs.
 fn insert_emi_metadata(
     metadata: &mut mascot_rs::prelude::MascotGenericFormatMetadata,
     record: &TaxoRecord,
 ) -> mascot_rs::prelude::Result<()> {
-    metadata.insert_arbitrary_metadata("EMI_FEATURE_ID", &record.feature_id)?;
-    if let Some(source_taxon_id) = record.source_taxon_id {
-        metadata.insert_arbitrary_metadata("EMI_SOURCE_TAXON_ID", source_taxon_id.to_string())?;
-    }
-    if let Some(source_taxon_name) = &record.source_taxon_name {
-        metadata.insert_arbitrary_metadata("EMI_SOURCE_TAXON_NAME", source_taxon_name)?;
-    }
     if let Some(ncbi) = &record.ncbi {
         metadata.insert_arbitrary_metadata("EMI_TAXON_ID", ncbi.taxon_id.to_string())?;
-        metadata.insert_arbitrary_metadata("EMI_TAXON_NAME", &ncbi.scientific_name)?;
-        metadata.insert_arbitrary_metadata("EMI_TAXON_RANK", &ncbi.rank)?;
-        metadata.insert_arbitrary_metadata(
-            "EMI_TAXON_LINEAGE_IDS",
-            ncbi.lineage_ids
-                .iter()
-                .map(u64::to_string)
-                .collect::<Vec<_>>()
-                .join("|"),
-        )?;
-        metadata
-            .insert_arbitrary_metadata("EMI_TAXON_LINEAGE_NAMES", ncbi.lineage_names.join("|"))?;
     }
     Ok(())
-}
-
-/// Builds the output path for an enriched MGF file.
-fn output_path_for(input_path: &Path, output_dir: &Path) -> PathBuf {
-    let stem = input_path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("enriched");
-    output_dir.join(format!("{stem}_emi_taxo_enriched.mgf"))
 }
 
 #[cfg(test)]
@@ -205,20 +226,7 @@ mod tests {
     use crate::taxonomy::ResolvedTaxon;
 
     #[test]
-    /// Verifies enriched MGF file names keep the source stem.
-    fn output_path_uses_enriched_suffix() {
-        let path = output_path_for(
-            Path::new("VGF159_A02_features_ms2_pos.mgf"),
-            Path::new("out"),
-        );
-        assert_eq!(
-            path,
-            PathBuf::from("out/VGF159_A02_features_ms2_pos_emi_taxo_enriched.mgf")
-        );
-    }
-
-    #[test]
-    /// Verifies EMI headers are inserted through the mascot-rs metadata API.
+    /// Verifies only the minimal EMI taxonomy header is inserted.
     fn inserts_emi_metadata_with_mascot_api() {
         let document = concat!(
             "BEGIN IONS\n",
@@ -257,13 +265,59 @@ mod tests {
             spectra[0]
                 .metadata()
                 .arbitrary_metadata_value("EMI_TAXON_LINEAGE_NAMES"),
-            Some("root|Homo sapiens")
+            None
+        );
+        assert_eq!(
+            spectra[0]
+                .metadata()
+                .arbitrary_metadata_value("EMI_SOURCE_TAXON_ID"),
+            None
         );
     }
 
     #[test]
-    /// Verifies top-K filtering is delegated to mascot-rs and preserves MGF metadata.
-    fn keeps_top_k_peaks_with_mascot_api() {
+    /// Verifies requested sample-level metadata headers are inserted verbatim.
+    fn inserts_sample_metadata_with_mascot_api() {
+        let document = concat!(
+            "BEGIN IONS\n",
+            "FEATURE_ID=feature-1\n",
+            "PEPMASS=250.0\n",
+            "CHARGE=1\n",
+            "MSLEVEL=2\n",
+            "100.0 10.0\n",
+            "END IONS\n",
+        );
+        let mut spectra: MGFVec = document.parse().expect("valid fixture");
+        let metadata = vec![
+            ("sample_id".to_string(), "VGF159_A02".to_string()),
+            (
+                "bio_leish_donovani_10ugml_inhibition".to_string(),
+                "12.5".to_string(),
+            ),
+            (
+                "sample_filename_pos".to_string(),
+                "VGF159_A02_pos.raw".to_string(),
+            ),
+        ];
+
+        let spectrum = spectra.iter_mut().next().expect("one spectrum");
+        insert_sample_metadata(spectrum.metadata_mut(), &metadata).expect("metadata insert");
+
+        assert_eq!(
+            spectra[0].metadata().arbitrary_metadata_value("sample_id"),
+            Some("VGF159_A02")
+        );
+        assert_eq!(
+            spectra[0]
+                .metadata()
+                .arbitrary_metadata_value("sample_filename_pos"),
+            Some("VGF159_A02_pos.raw")
+        );
+    }
+
+    #[test]
+    /// Verifies peak processing is delegated to mascot-rs and preserves MGF metadata.
+    fn processes_peaks_with_mascot_api() {
         let document = concat!(
             "BEGIN IONS\n",
             "FEATURE_ID=feature-1\n",
@@ -277,12 +331,41 @@ mod tests {
         );
         let spectra: MGFVec = document.parse().expect("valid fixture");
 
-        let filtered =
-            apply_top_k_peaks(spectra, 2, Path::new("fixture.mgf")).expect("top-k filtering");
+        let filtered = apply_peak_processing(spectra, 2, true, Path::new("fixture.mgf"))
+            .expect("peak processing");
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].len(), 2);
         assert_eq!(filtered[0].feature_id(), Some("feature-1"));
+        assert_eq!(filtered[0].intensities().fold(0.0_f64, f64::max), 1.0);
+    }
+
+    #[test]
+    /// Verifies normalized intensities are written to the output MGF file.
+    fn writes_normalized_intensities() {
+        let document = concat!(
+            "BEGIN IONS\n",
+            "FEATURE_ID=feature-1\n",
+            "PEPMASS=250.0\n",
+            "CHARGE=1\n",
+            "MSLEVEL=2\n",
+            "100.0 10.0\n",
+            "150.0 50.0\n",
+            "200.0 20.0\n",
+            "END IONS\n",
+        );
+        let spectra: MGFVec = document.parse().expect("valid fixture");
+        let filtered = apply_peak_processing(spectra, 2, true, Path::new("fixture.mgf"))
+            .expect("peak processing");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let output_path = temp_dir.path().join("out.mgf");
+
+        write_mgf_file(&filtered, &output_path, false).expect("write mgf");
+
+        let output = std::fs::read_to_string(output_path).expect("read output");
+        assert!(output.contains("150 1\n"));
+        assert!(output.contains("200 0.4\n"));
+        assert!(!output.contains("150 50"));
     }
 
     #[test]

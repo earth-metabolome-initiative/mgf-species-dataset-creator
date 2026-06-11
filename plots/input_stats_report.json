@@ -1,0 +1,79 @@
+{
+  "dataset_dir": ".cache/extracted/pf1600_raw",
+  "mgf_files": 3840,
+  "spectra": 1431304,
+  "bins": 60,
+  "summaries": [
+    {
+      "polarity": "pos",
+      "metric": "peak_count",
+      "count": 906509,
+      "min": 1.0,
+      "q1": 25.0,
+      "median": 45.0,
+      "mean": 50.689865186115085,
+      "q3": 71.0,
+      "max": 654.0
+    },
+    {
+      "polarity": "neg",
+      "metric": "peak_count",
+      "count": 524795,
+      "min": 2.0,
+      "q1": 18.0,
+      "median": 25.0,
+      "mean": 28.115917644032432,
+      "q3": 35.0,
+      "max": 480.0
+    },
+    {
+      "polarity": "pos",
+      "metric": "feature_count",
+      "count": 1920,
+      "min": 11.0,
+      "q1": 280.0,
+      "median": 432.0,
+      "mean": 472.1401041666667,
+      "q3": 593.0,
+      "max": 1655.0
+    },
+    {
+      "polarity": "neg",
+      "metric": "feature_count",
+      "count": 1920,
+      "min": 0.0,
+      "q1": 124.75,
+      "median": 220.0,
+      "mean": 273.3307291666667,
+      "q3": 322.25,
+      "max": 1422.0
+    },
+    {
+      "polarity": "pos",
+      "metric": "parent_mz",
+      "count": 906509,
+      "min": 120.0447,
+      "q1": 330.2643,
+      "median": 425.3804,
+      "mean": 456.38898370674025,
+      "q3": 566.4773,
+      "max": 1496.7805
+    },
+    {
+      "polarity": "neg",
+      "metric": "parent_mz",
+      "count": 524795,
+      "min": 120.0442,
+      "q1": 333.2074,
+      "median": 449.1093,
+      "mean": 477.9241203332544,
+      "q3": 577.3379,
+      "max": 1495.8371
+    }
+  ],
+  "plots": [
+    "plots/peak_count_distribution.svg",
+    "plots/feature_count_distribution.svg",
+    "plots/parent_mz_distribution.svg"
+  ]
+}

@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use mascot_rs::prelude::MGFVec;
 use serde::Serialize;
 use tracing::info;
 
@@ -9,7 +10,7 @@ use crate::Error;
 use crate::archive::{ensure_extracted, find_mgf_files, find_taxo_outputs};
 use crate::config::PipelineConfig;
 use crate::error::{IoResultExt, Result};
-use crate::mgf::{EnrichmentStats, enrich_mgf_file};
+use crate::mgf::{EnrichmentStats, enrich_mgf_records, write_mgf_file};
 use crate::progress::ProgressReporter;
 use crate::taxo::TaxoDataset;
 use crate::taxonomy::NcbiTaxonomyResolver;
@@ -32,6 +33,8 @@ pub struct ProcessedMgf {
     pub spectra_without_ncbi_resolution: usize,
     /// Number of most intense peaks kept per spectrum; zero means all peaks were kept.
     pub top_k_peaks: usize,
+    /// Whether peak intensities were normalized.
+    pub normalize_peak_intensities: bool,
 }
 
 /// Report for a completed pipeline run.
@@ -125,43 +128,65 @@ pub async fn run_pipeline_with_progress(
     ));
 
     std::fs::create_dir_all(&config.output_dir).with_path(&config.output_dir)?;
+    let aggregate_outputs = aggregate_outputs_for(&config);
+    for output_path in aggregate_outputs.iter().flatten() {
+        if output_path.exists() && !config.overwrite {
+            return Err(Error::OutputExists(output_path.clone()));
+        }
+    }
     let bar = progress.bar(
         total_mgfs as u64,
         if config.top_k_peaks == 0 {
             "Enriching MGF files without peak filtering".to_string()
         } else {
             format!(
-                "Enriching MGF files and keeping top {} peaks",
-                config.top_k_peaks
+                "Enriching MGF files, keeping top {} peaks, normalizing intensities: {}",
+                config.top_k_peaks, config.normalize_peak_intensities
             )
         },
     );
     let mut processed_mgfs = Vec::with_capacity(total_mgfs);
+    let mut pos_spectra = MGFVec::default();
+    let mut neg_spectra = MGFVec::default();
     for (sample_root, taxo, mgf_paths) in sample_jobs {
-        let sample_output_dir = config.output_dir.join(
-            sample_root
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("sample"),
-        );
         for input_path in mgf_paths {
             bar.set_message(format!(
                 "Enriching {}",
                 ProgressReporter::file_label(&input_path)
             ));
             info!(path = %input_path.display(), "enriching MGF");
-            let stats = enrich_mgf_file(
-                &input_path,
-                &sample_output_dir,
-                &taxo,
-                config.top_k_peaks,
-                config.overwrite,
+            let output_path = aggregate_output_for_path(&input_path, &aggregate_outputs)?;
+            let sample_metadata = sample_metadata_headers_for_mgf(
+                &sample_root,
+                polarity_label_for_path(&input_path),
             )?;
-            processed_mgfs.push(processed_from_stats(stats));
+            let enriched = enrich_mgf_records(
+                &input_path,
+                &output_path,
+                &taxo,
+                &sample_metadata,
+                config.top_k_peaks,
+                config.normalize_peak_intensities,
+            )?;
+            let mut spectra = enriched.spectra;
+            match polarity_label_for_path(&input_path) {
+                PolarityLabel::Pos => pos_spectra.append(&mut spectra),
+                PolarityLabel::Neg => neg_spectra.append(&mut spectra),
+            }
+            processed_mgfs.push(processed_from_stats(enriched.stats));
             bar.inc(1);
         }
     }
     bar.finish_with_message("MGF enrichment complete");
+
+    let spinner = progress.spinner("Writing aggregate polarity MGF files");
+    if let Some(output_path) = &aggregate_outputs.pos {
+        write_mgf_file(&pos_spectra, output_path, config.overwrite)?;
+    }
+    if let Some(output_path) = &aggregate_outputs.neg {
+        write_mgf_file(&neg_spectra, output_path, config.overwrite)?;
+    }
+    spinner.finish_with_message("Aggregate polarity MGF files written");
 
     let report = PipelineReport {
         record_id: config.record_id,
@@ -176,6 +201,179 @@ pub async fn run_pipeline_with_progress(
         config.output_dir.join("pipeline_report.json").display()
     ));
     Ok(report)
+}
+
+/// Returns requested sample-level metadata headers for one MGF polarity.
+fn sample_metadata_headers_for_mgf(
+    sample_root: &Path,
+    polarity: PolarityLabel,
+) -> Result<Vec<(String, String)>> {
+    let Some(sample_id) = sample_root.file_name().and_then(|name| name.to_str()) else {
+        return Ok(Vec::new());
+    };
+    let metadata_path = sample_root.join(format!("{sample_id}_metadata.tsv"));
+    if !metadata_path.exists() {
+        return Ok(Vec::new());
+    }
+    let mut reader = csv::ReaderBuilder::new()
+        .delimiter(b'\t')
+        .flexible(true)
+        .from_path(&metadata_path)
+        .map_err(|source| Error::Csv {
+            path: metadata_path.clone(),
+            source,
+        })?;
+    let headers = reader
+        .headers()
+        .map_err(|source| Error::Csv {
+            path: metadata_path.clone(),
+            source,
+        })?
+        .clone();
+    let Some(row) = reader
+        .records()
+        .next()
+        .transpose()
+        .map_err(|source| Error::Csv {
+            path: metadata_path.clone(),
+            source,
+        })?
+    else {
+        return Ok(Vec::new());
+    };
+
+    let mut output = Vec::new();
+    push_metadata_columns(
+        &headers,
+        &row,
+        &mut output,
+        &["sample_id", "sample_type", "sample_plate_id"],
+    );
+    match polarity {
+        PolarityLabel::Pos => push_metadata_columns(
+            &headers,
+            &row,
+            &mut output,
+            &["sample_filename_pos", "pos_injection_date"],
+        ),
+        PolarityLabel::Neg => push_metadata_columns(
+            &headers,
+            &row,
+            &mut output,
+            &["sample_filename_neg", "neg_injection_date"],
+        ),
+    }
+    push_metadata_columns(
+        &headers,
+        &row,
+        &mut output,
+        &[
+            "bio_leish_donovani_10ugml_inhibition",
+            "bio_leish_donovani_2ugml_inhibition",
+            "bio_tryp_brucei_rhodesiense_10ugml_inhibition",
+            "bio_tryp_brucei_rhodesiense_2ugml_inhibition",
+            "bio_tryp_cruzi_10ugml_inhibition",
+            "bio_l6_cytotoxicity_10ugml_inhibition",
+        ],
+    );
+    if !output.iter().any(|(key, _)| key == "sample_id") {
+        output.insert(0, ("sample_id".to_string(), sample_id.to_string()));
+    }
+    Ok(output)
+}
+
+/// Pushes non-empty metadata values for selected TSV columns.
+fn push_metadata_columns(
+    headers: &csv::StringRecord,
+    row: &csv::StringRecord,
+    output: &mut Vec<(String, String)>,
+    columns: &[&str],
+) {
+    for column in columns {
+        if let Some(value) = headers
+            .iter()
+            .position(|header| header == *column)
+            .and_then(|index| row.get(index))
+            .and_then(non_empty_metadata_value)
+        {
+            output.push(((*column).to_string(), value));
+        }
+    }
+}
+
+/// Returns non-empty metadata strings, excluding common missing-value markers.
+fn non_empty_metadata_value(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty() && !matches!(trimmed, "NA" | "N/A" | "NaN" | "nan"))
+        .then(|| trimmed.to_string())
+}
+
+/// Aggregate output paths selected for a pipeline run.
+#[derive(Debug, Clone)]
+struct AggregateOutputs {
+    /// Positive-mode output path, when requested.
+    pos: Option<PathBuf>,
+    /// Negative-mode output path, when requested.
+    neg: Option<PathBuf>,
+}
+
+impl AggregateOutputs {
+    /// Returns an iterator over selected output paths.
+    fn iter(&self) -> impl Iterator<Item = &Option<PathBuf>> {
+        [&self.pos, &self.neg].into_iter()
+    }
+}
+
+/// Returns the aggregate output files requested by the polarity selector.
+fn aggregate_outputs_for(config: &PipelineConfig) -> AggregateOutputs {
+    AggregateOutputs {
+        pos: matches!(
+            config.polarity,
+            crate::Polarity::Pos | crate::Polarity::Both
+        )
+        .then(|| config.output_dir.join("emi_taxo_enriched_pos.mgf")),
+        neg: matches!(
+            config.polarity,
+            crate::Polarity::Neg | crate::Polarity::Both
+        )
+        .then(|| config.output_dir.join("emi_taxo_enriched_neg.mgf")),
+    }
+}
+
+/// Returns the aggregate output file matching one source MGF path.
+fn aggregate_output_for_path(path: &Path, outputs: &AggregateOutputs) -> Result<PathBuf> {
+    match polarity_label_for_path(path) {
+        PolarityLabel::Pos => outputs
+            .pos
+            .clone()
+            .ok_or_else(|| Error::NoMgfFiles("pos".to_string(), path.to_path_buf())),
+        PolarityLabel::Neg => outputs
+            .neg
+            .clone()
+            .ok_or_else(|| Error::NoMgfFiles("neg".to_string(), path.to_path_buf())),
+    }
+}
+
+/// Polarity labels inferred from MGF file names.
+#[derive(Debug, Clone, Copy)]
+enum PolarityLabel {
+    /// Positive ionization mode.
+    Pos,
+    /// Negative ionization mode.
+    Neg,
+}
+
+/// Infers the binary polarity from a feature MS2 MGF path.
+fn polarity_label_for_path(path: &Path) -> PolarityLabel {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if name.contains("_ms2_neg") || name.ends_with("_neg.mgf") {
+        PolarityLabel::Neg
+    } else {
+        PolarityLabel::Pos
+    }
 }
 
 /// Resolves the dataset root by using existing extracted data or downloading and extracting.
@@ -221,6 +419,7 @@ fn processed_from_stats(stats: EnrichmentStats) -> ProcessedMgf {
         spectra_without_taxo: stats.spectra_without_taxo,
         spectra_without_ncbi_resolution: stats.spectra_without_ncbi_resolution,
         top_k_peaks: stats.top_k_peaks,
+        normalize_peak_intensities: stats.normalize_peak_intensities,
     }
 }
 
@@ -276,4 +475,62 @@ fn is_blank_or_qc_sample(sample_root: &Path) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+#[cfg(test)]
+/// Tests for pipeline metadata helpers.
+mod tests {
+    use super::*;
+
+    #[test]
+    /// Verifies polarity-specific sample filename and injection date fields are filtered.
+    fn sample_metadata_keeps_only_matching_polarity_fields() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let sample_root = temp_dir.path().join("VGF159_A02");
+        std::fs::create_dir_all(&sample_root).expect("sample dir");
+        std::fs::write(
+            sample_root.join("VGF159_A02_metadata.tsv"),
+            concat!(
+                "sample_id\tsample_type\tsample_plate_id\tsample_filename_pos\tpos_injection_date\t",
+                "bio_leish_donovani_10ugml_inhibition\tsample_filename_neg\tneg_injection_date\n",
+                "VGF159_A02\tsample\tplate-1\tpos.raw\t2021-01-01\t42\tneg.raw\t2021-01-02\n",
+            ),
+        )
+        .expect("metadata");
+
+        let pos_metadata =
+            sample_metadata_headers_for_mgf(&sample_root, PolarityLabel::Pos).expect("pos");
+        let neg_metadata =
+            sample_metadata_headers_for_mgf(&sample_root, PolarityLabel::Neg).expect("neg");
+
+        assert!(pos_metadata.contains(&("sample_filename_pos".to_string(), "pos.raw".to_string())));
+        assert!(
+            pos_metadata.contains(&("pos_injection_date".to_string(), "2021-01-01".to_string()))
+        );
+        assert!(
+            !pos_metadata
+                .iter()
+                .any(|(key, _)| key == "sample_filename_neg")
+        );
+        assert!(
+            !pos_metadata
+                .iter()
+                .any(|(key, _)| key == "neg_injection_date")
+        );
+
+        assert!(neg_metadata.contains(&("sample_filename_neg".to_string(), "neg.raw".to_string())));
+        assert!(
+            neg_metadata.contains(&("neg_injection_date".to_string(), "2021-01-02".to_string()))
+        );
+        assert!(
+            !neg_metadata
+                .iter()
+                .any(|(key, _)| key == "sample_filename_pos")
+        );
+        assert!(
+            !neg_metadata
+                .iter()
+                .any(|(key, _)| key == "pos_injection_date")
+        );
+    }
 }

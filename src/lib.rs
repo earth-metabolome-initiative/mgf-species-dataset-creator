@@ -12,6 +12,8 @@ pub mod error;
 pub mod mgf;
 /// End-to-end pipeline orchestration.
 pub mod pipeline;
+/// Input dataset plotting and statistics helpers.
+pub mod plot;
 /// Terminal progress reporting helpers.
 pub mod progress;
 /// Utilities for repairing and publishing corrected PF1600 archives.

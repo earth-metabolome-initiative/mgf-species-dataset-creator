@@ -89,6 +89,8 @@ pub struct PipelineConfig {
     pub polarity: Polarity,
     /// Number of most intense fragment peaks to keep per spectrum; zero disables filtering.
     pub top_k_peaks: usize,
+    /// Whether fragment intensities are normalized through mascot-rs.
+    pub normalize_peak_intensities: bool,
     /// Whether existing output files may be replaced.
     pub overwrite: bool,
 }
@@ -106,6 +108,7 @@ impl Default for PipelineConfig {
             output_dir: PathBuf::from("output"),
             polarity: Polarity::Both,
             top_k_peaks: 128,
+            normalize_peak_intensities: true,
             overwrite: false,
         }
     }
